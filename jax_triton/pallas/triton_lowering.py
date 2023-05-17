@@ -29,15 +29,15 @@ from jax._src import pjit
 from jax._src import state
 from jax._src import util
 from jax._src.lax.control_flow import for_loop
-from jax._src.lib import gpu_triton as triton_kernel_call_lib
+from jax._src.lib import gpu_triton
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import mhlo
 from jax._src.state import AbstractRef
 from jax._src.state import discharge
 from jax._src.state import primitives as sp
-from jax._src.util import split_list
 from jax._src.util import merge_lists
 from jax._src.util import partition_list
+from jax._src.util import split_list
 from jax._src.util import weakref_lru_cache
 from jax.interpreters import mlir
 from jax.interpreters import partial_eval as pe
@@ -47,7 +47,7 @@ from jax_triton import utils as triton_utils
 from jax_triton.pallas import core as pallas_core
 from jax_triton.pallas import pallas_call_p
 from jax_triton.pallas import primitives
-from jax_triton.triton_lib import compile_ttir_inplace
+from jax_triton.triton_lib import compile_ttir_to_ptx_inplace
 from jax_triton.triton_lib import get_triton_type
 import numpy as np
 from triton._C.libtriton.triton import ir as tl_ir
@@ -106,9 +106,11 @@ class TritonLoweringResult:
 
 @dataclasses.dataclass
 class TritonCompilationResult:
-  cubin: bytes
-  name: str
-  shared_mem: int
+  kernel_name: str
+  ttir: str
+  ptx: str
+  shared_mem_bytes: int
+  compute_capability: int
   lowering_result: TritonLoweringResult
 
 
@@ -1412,15 +1414,17 @@ def compile_jaxpr(
       jaxpr, in_shapes, grid_spec, name
   )
   device = 0
-  ttir = lowering_result.module
-  cubin, name, shared_mem = compile_ttir_inplace(
-      ttir,
+  ttir = str(lowering_result.module)
+  ptx, name, shared_mem_bytes, compute_capability = compile_ttir_to_ptx_inplace(
+      lowering_result.module,
       device=device,
       num_warps=num_warps,
       num_stages=num_stages,
       dump=debug,
   )
-  return TritonCompilationResult(cubin, name, shared_mem, lowering_result)
+  return TritonCompilationResult(
+      name, ttir, ptx, shared_mem_bytes, compute_capability, lowering_result
+  )
 
 
 def pallas_call_lowering(
@@ -1466,12 +1470,42 @@ def pallas_call_lowering(
       num_stages,
       debug=debug,
   )
-  cubin = compilation_result.cubin
-  name = compilation_result.name
-  shared_mem = compilation_result.shared_mem
-  lowering_result = compilation_result.lowering_result
+
   if debug:
-    lowering_result.module.dump()
+    compilation_result.lowering_result.module.dump()
+
+  kernel = gpu_triton.triton_pb2.TritonKernel(
+      kernel_name=compilation_result.kernel_name,
+      num_warps=num_warps,
+      shared_mem_bytes=compilation_result.shared_mem_bytes,
+      ptx=compilation_result.ptx,
+      ttir=compilation_result.ttir,
+      compute_capability=compilation_result.compute_capability,
+  )
+
+  grid = triton_utils.normalize_grid(
+      compilation_result.lowering_result.grid, metaparams={}
+  )
+
+  kernel_call = gpu_triton.triton_pb2.TritonKernelCall(
+      kernel=kernel,
+      grid_0=grid[0],
+      grid_1=grid[1],
+      grid_2=grid[2],
+  )
+
+  for _ in range(len(in_shapes) + len(out_shapes)):
+    kernel_call.parameters.add(
+        array=gpu_triton.triton_pb2.TritonKernelCall.ArrayParameter(
+            bytes_to_zero=0,  # TODO(cjfj): Expose through user API.
+            ptr_must_be_divisible_by_16=True,
+        )
+    )
+
+  kernel_call = gpu_triton.triton_pb2.TritonAnyKernelCall(
+      kernel_call=kernel_call
+  )
+
   out_type = ir.TupleType.get_tuple(
       [
           ir.RankedTensorType.get(
@@ -1480,24 +1514,7 @@ def pallas_call_lowering(
           for out_shape in ctx.avals_out
       ]
   )
-  kernel = triton_kernel_call_lib.TritonKernel(
-      cubin, name, num_warps, shared_mem
-  )
-  grid = triton_utils.normalize_grid(
-      compilation_result.lowering_result.grid, metaparams={}
-  )
-  kernel_params = []
-  for _ in range(len(in_shapes) + len(out_shapes)):
-    kernel_params.append(
-        triton_kernel_call_lib.create_array_parameter(
-            0,  # bytes to zero  # TODO(cjfj): Expose through user API.
-            True,  # divisible by 16
-        )
-    )
-  kernel_call = triton_kernel_call_lib.TritonKernelCall(
-      kernel, grid[0], grid[1], grid[2], kernel_params
-  )
-  ctx.module_context.add_keepalive(kernel_call)
+
   output_operand_aliases = ir.ArrayAttr.get(
       [
           mhlo.OutputOperandAlias.get(
@@ -1508,12 +1525,13 @@ def pallas_call_lowering(
           for input, output in input_output_aliases
       ]
   )
+
   out = mhlo.CustomCallOp(
       [out_type],
       in_nodes,
       call_target_name=ir.StringAttr.get("triton_kernel_call"),
       has_side_effect=ir.BoolAttr.get(False),
-      backend_config=ir.StringAttr.get(kernel_call.descriptor),
+      backend_config=ir.StringAttr.get(kernel_call.SerializeToString()),
       api_version=mlir.i32_attr(2),  # API_VERSION_STATUS_RETURNING
       called_computations=ir.ArrayAttr.get([]),
       operand_layouts=triton_utils.avals_to_layouts(ctx.avals_in),
@@ -1530,6 +1548,6 @@ def pallas_call_lowering(
 mlir.register_lowering(pallas_call_p, pallas_call_lowering, platform="cuda")
 xc.register_custom_call_target(
     "triton_kernel_call",
-    triton_kernel_call_lib.get_custom_call(),
+    gpu_triton.get_custom_call(),
     platform="CUDA",
 )
